@@ -19,6 +19,7 @@ import inspect
 import os
 import random
 import re
+import math
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
@@ -165,7 +166,16 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
         self.autocast_enabled = True
         self.vae_autocast_enabled = True
         self.enable_offloading = enable_offloading
-        self.execution_device = torch.device(execution_device)
+        # Prefer CUDA for execution when available, but don't crash if it's not.
+        if execution_device is None:
+            self.execution_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            requested = torch.device(execution_device)
+            if requested.type == "cuda" and not torch.cuda.is_available():
+                self.execution_device = torch.device("cpu")
+            else:
+                self.execution_device = requested
+        self._autocast_device_type = "cuda" if self.execution_device.type == "cuda" else "cpu"
 
         if vision_encoder:
             self.register_modules(vision_encoder=vision_encoder)
@@ -509,8 +519,9 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
         w = w * 1000.0
 
         half_dim = embedding_dim // 2
-        emb = torch.log(torch.tensor(10000.0)) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, dtype=dtype) * -emb)
+        # Avoid creating CPU tensors: keep everything on w.device.
+        emb = math.log(10000.0) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=w.device, dtype=dtype) * (-emb))
         emb = w.to(dtype)[:, None] * emb[None, :]
         emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
         if embedding_dim % 2 == 1:  # zero pad
@@ -715,10 +726,12 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
         """
         if reference_image is None:
             vision_states = torch.zeros(
-                                    latents.shape[0], 
-                                    self.config.vision_num_semantic_tokens, 
-                                    self.config.vision_states_dim
-                                    ).to(latents.device)
+                latents.shape[0],
+                self.config.vision_num_semantic_tokens,
+                self.config.vision_states_dim,
+                device=device,
+                dtype=self.target_dtype,
+            )
         else:
             reference_image = np.array(reference_image) if isinstance(reference_image, Image.Image) else reference_image
             if len(reference_image.shape) == 4:
@@ -768,26 +781,32 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
                                     latents.shape[2], 
                                     latents.shape[3], 
                                     latents.shape[4]
-                                    ).to(latents.device)
+                                    , device=latents.device, dtype=latents.dtype)
         
-        mask_zeros = torch.zeros(latents.shape[0], 1, latents.shape[2], latents.shape[3], latents.shape[4])
-        mask_ones = torch.ones(latents.shape[0], 1, latents.shape[2], latents.shape[3], latents.shape[4])
+        mask_zeros = torch.zeros(
+            latents.shape[0], 1, latents.shape[2], latents.shape[3], latents.shape[4],
+            device=latents.device, dtype=latents.dtype
+        )
+        mask_ones = torch.ones(
+            latents.shape[0], 1, latents.shape[2], latents.shape[3], latents.shape[4],
+            device=latents.device, dtype=latents.dtype
+        )
         mask_concat = merge_tensor_by_mask(
-                                        mask_zeros.cpu(), 
-                                        mask_ones.cpu(), 
-                                        mask=multitask_mask.cpu(), 
-                                        dim=2
-                                        ).to(device=latents.device)
+            mask_zeros,
+            mask_ones,
+            mask=multitask_mask.to(device=latents.device),
+            dim=2,
+        )
 
         cond_latents = torch.concat([latents_concat, mask_concat], dim=1)
         
         return cond_latents
 
-    def get_task_mask(self, task_type, latent_target_length):
+    def get_task_mask(self, task_type, latent_target_length, device: Optional[torch.device] = None):
         if task_type == "t2v":
-            mask = torch.zeros(latent_target_length)
+            mask = torch.zeros(latent_target_length, device=device)
         elif task_type == "i2v":
-            mask = torch.zeros(latent_target_length)
+            mask = torch.zeros(latent_target_length, device=device)
             mask[0] = 1.0
         else:
             raise ValueError(f"{task_type} is not supported !")
@@ -880,7 +899,11 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
             ref_images_pixel_values = ref_image_transform(reference_image)
             ref_images_pixel_values = ref_images_pixel_values.unsqueeze(0).unsqueeze(2).to(self.execution_device)
             
-            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True):
+            with torch.autocast(
+                device_type=self._autocast_device_type,
+                dtype=torch.float16,
+                enabled=(self.execution_device.type == "cuda"),
+            ):
                 cond_latents = self.vae.encode(ref_images_pixel_values).latent_dist.mode()
                 cond_latents.mul_(self.vae.config.scaling_factor)
             
@@ -942,7 +965,11 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
         positive_idx = 1 if self.do_classifier_free_guidance else 0
         stabilization_level = 15
         # text, siglip, byt5 embedding cache
-        with (torch.autocast(device_type="cuda", dtype=self.target_dtype, enabled=self.autocast_enabled),
+        with (torch.autocast(
+                device_type=self._autocast_device_type,
+                dtype=self.target_dtype,
+                enabled=(self.autocast_enabled and self.execution_device.type == "cuda"),
+            ),
               auto_offload_model(self.transformer, self.execution_device, enabled=self.enable_offloading)):
             extra_kwargs_pos = {
                 "byt5_text_states": extra_kwargs["byt5_text_states"][positive_idx, None, ...],
@@ -1008,7 +1035,11 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
                 context_timestep = torch.full((len(selected_frame_indices),), stabilization_level - 1,
                                               device=device, dtype=timesteps.dtype)
                 # compute kv cache
-                with (torch.autocast(device_type="cuda", dtype=self.target_dtype, enabled=self.autocast_enabled),
+                with (torch.autocast(
+                        device_type=self._autocast_device_type,
+                        dtype=self.target_dtype,
+                        enabled=(self.autocast_enabled and self.execution_device.type == "cuda"),
+                    ),
                       auto_offload_model(self.transformer, self.execution_device,enabled=self.enable_offloading)):
                     self.transformer.forward_vision(
                         context_latents_input,
@@ -1060,7 +1091,11 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
                     latents_concat = torch.concat([latent_model_input, cond_latents_input], dim=1)
                     latents_concat = self.scheduler.scale_model_input(latents_concat, t)
 
-                    with torch.autocast(device_type="cuda", dtype=self.target_dtype, enabled=self.autocast_enabled):
+                    with torch.autocast(
+                        device_type=self._autocast_device_type,
+                        dtype=self.target_dtype,
+                        enabled=(self.autocast_enabled and self.execution_device.type == "cuda"),
+                    ):
                         noise_pred = self.transformer.forward_vision(
                             latents_concat,
                             timestep_input,
@@ -1188,7 +1223,11 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
                     Ks_input = repeat(Ks_input, 'B L H W -> (B R) L H W', R=batch_size).to(device)
                     action_input = repeat(action_input, 'B L -> (B R) L', R=batch_size).reshape(-1).to(device)
 
-                    with torch.autocast(device_type="cuda", dtype=self.target_dtype, enabled=self.autocast_enabled):
+                    with torch.autocast(
+                        device_type=self._autocast_device_type,
+                        dtype=self.target_dtype,
+                        enabled=(self.autocast_enabled and self.execution_device.type == "cuda"),
+                    ):
                         output = self.transformer(
                             latents_concat,
                             t_expand,
@@ -1415,7 +1454,7 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
 
         latent_target_length, latent_height, latent_width = self.get_latent_size(video_length, height, width)
         n_tokens = latent_target_length * latent_height * latent_width
-        multitask_mask = self.get_task_mask(task_type, latent_target_length)
+        multitask_mask = self.get_task_mask(task_type, latent_target_length, device=device)
 
 
         self._guidance_scale = guidance_scale
@@ -1609,7 +1648,11 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
 
 
             if return_pre_sr_video or not enable_sr:
-                with (torch.autocast(device_type="cuda", dtype=self.vae_dtype, enabled=self.vae_autocast_enabled),
+                with (torch.autocast(
+                        device_type=self._autocast_device_type,
+                        dtype=self.vae_dtype,
+                        enabled=(self.vae_autocast_enabled and self.execution_device.type == "cuda"),
+                    ),
                       auto_offload_model(self.vae, self.execution_device, enabled=self.enable_offloading)):
                     video_frames = self.vae.decode(latents, return_dict=False, generator=generator)[0]
 
@@ -1678,7 +1721,7 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
             byt5_tokenizer=self.byt5_tokenizer,
             byt5_max_length=self.byt5_max_length,
             prompt_format=self.prompt_format,
-            execution_device='cuda',
+            execution_device=str(self.execution_device),
             vision_encoder=self.vision_encoder,
             enable_offloading=self.enable_offloading,
             **SR_PIPELINE_CONFIGS[sr_version],
@@ -1703,23 +1746,30 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
         else:
             cached_folder = pretrained_model_name_or_path
 
-        if enable_group_offloading is None:
+        # Respect explicit user choices. Only auto-decide when values are not provided.
+        if enable_offloading is None and enable_group_offloading is None:
             offloading_config = cls.get_offloading_config()
             enable_offloading = offloading_config['enable_offloading']
             enable_group_offloading = offloading_config['enable_group_offloading']
+        elif enable_offloading is None:
+            # Group offloading implies offloading.
+            enable_offloading = bool(enable_group_offloading)
+        elif enable_group_offloading is None:
+            enable_group_offloading = bool(enable_offloading)
 
-        if enable_offloading:
-            # Assuming the user does not have sufficient GPU memory, we initialize the models on CPU
-            device = torch.device('cpu')
+        if device is None:
+            compute_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         else:
-            if device is None:
-                device = torch.device('cuda')
+            compute_device = torch.device(device)
+
+        # If offloading is enabled we still *execute* on compute_device, but initialize weights on CPU.
+        init_device = torch.device('cpu') if enable_offloading else compute_device
 
         if enable_group_offloading:
             # Assuming the user does not have sufficient GPU memory, we initialize the models on CPU
             transformer_init_device = torch.device('cpu')
         else:
-            transformer_init_device = device
+            transformer_init_device = init_device
 
         supported_transformer_version = os.listdir(os.path.join(cached_folder, "transformer"))
         if transformer_version not in supported_transformer_version:
@@ -1738,7 +1788,7 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
         if action_ckpt is not None:
             from safetensors.torch import load_file
             safetensor_path = action_ckpt
-            state_dict = load_file(safetensor_path, device="cuda")
+            state_dict = load_file(safetensor_path, device=str(compute_device))
             transformer.load_state_dict(state_dict, strict=True)
             print('HY-World 1.5 loading from: ', action_ckpt)
 
@@ -1747,7 +1797,7 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
         vae = hunyuanvideo_15_vae_w_cache.AutoencoderKLConv3D.from_pretrained(
             os.path.join(cached_folder, "vae"), 
             torch_dtype=vae_inference_config['dtype']
-        ).to(device)
+        ).to(init_device)
         scheduler = FlowMatchDiscreteScheduler.from_pretrained(os.path.join(cached_folder, "scheduler"))
 
         if force_sparse_attn:
@@ -1764,12 +1814,12 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
                 )
             transformer.set_attn_mode('flex-block-attn')
 
-        byt5_kwargs, prompt_format = cls._load_byt5(cached_folder, True, 256, device=device)
-        text_encoder, text_encoder_2 = cls._load_text_encoders(cached_folder, device=device)
-        vision_encoder = cls._load_vision_encoder(cached_folder, device=device)
+        byt5_kwargs, prompt_format = cls._load_byt5(cached_folder, True, 256, device=init_device)
+        text_encoder, text_encoder_2 = cls._load_text_encoders(cached_folder, device=init_device)
+        vision_encoder = cls._load_vision_encoder(cached_folder, device=init_device)
 
         group_offloading_kwargs = {
-            'onload_device': torch.device('cuda'),
+            'onload_device': torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
             'num_blocks_per_group': 4,
         }
         if overlap_group_offloading:
@@ -1793,7 +1843,7 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
             byt5_tokenizer=byt5_kwargs["byt5_tokenizer"],
             byt5_max_length=byt5_kwargs["byt5_max_length"],
             prompt_format=prompt_format,
-            execution_device='cuda',
+            execution_device=str(compute_device),
             vision_encoder=vision_encoder,
             enable_offloading=enable_offloading,
             **PIPELINE_CONFIGS[transformer_version],
@@ -1805,7 +1855,7 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
                                                     cached_folder, 
                                                     sr_version, 
                                                     transformer_dtype=transformer_dtype, 
-                                                    device=device)
+                                                    device=init_device)
             pipeline.sr_pipeline = sr_pipeline
             if enable_group_offloading:
                 sr_pipeline.transformer.enable_group_offload(**group_offloading_kwargs)
@@ -1824,7 +1874,8 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
             }
         else:
             return {
-                'enable_offloading': True,
+                # With enough VRAM, keep models on GPU for speed.
+                'enable_offloading': False,
                 'enable_group_offloading': False,
             }
 
