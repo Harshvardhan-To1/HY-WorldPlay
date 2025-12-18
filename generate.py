@@ -27,13 +27,15 @@ import imageio
 import json
 import numpy as np
 from scipy.spatial.transform import Rotation as R
+from typing import Optional
 
 from hyvideo.pipelines.worldplay_video_pipeline import HunyuanVideo_1_5_Pipeline
 from hyvideo.commons.parallel_states import initialize_parallel_state
 from hyvideo.commons.infer_state import initialize_infer_state
 
 parallel_dims = initialize_parallel_state(sp=int(os.environ.get('WORLD_SIZE', '1')))
-torch.cuda.set_device(int(os.environ.get('LOCAL_RANK', '0')))
+if torch.cuda.is_available():
+    torch.cuda.set_device(int(os.environ.get('LOCAL_RANK', '0')))
 
 mapping = {
             (0,0,0,0): 0,
@@ -47,11 +49,13 @@ mapping = {
             (0,1,0,1): 8,
         }
 
-def one_hot_to_one_dimension(one_hot):
-    y = torch.tensor([mapping[tuple(row.tolist())] for row in one_hot])
+def one_hot_to_one_dimension(one_hot: torch.Tensor) -> torch.Tensor:
+    # Keep output on the same device as input.
+    device = one_hot.device
+    y = torch.tensor([mapping[tuple(row.tolist())] for row in one_hot], device=device, dtype=torch.long)
     return y
 
-def pose_to_input(pose_json_path, latent_chunk_num, tps=False):
+def pose_to_input(pose_json_path, latent_chunk_num, tps=False, device: Optional[torch.device] = None):
     pose_json = json.load(open(pose_json_path, 'r'))
     pose_keys = list(pose_json.keys())
     intrinsic_list = []
@@ -69,7 +73,7 @@ def pose_to_input(pose_json_path, latent_chunk_num, tps=False):
         intrinsic_list.append(intrinsic)
 
     w2c_list = np.array(w2c_list)
-    intrinsic_list = torch.tensor(np.array(intrinsic_list))
+    intrinsic_list = np.array(intrinsic_list)
 
     c2ws = np.linalg.inv(w2c_list)
     C_inv = np.linalg.inv(c2ws[:-1])
@@ -123,7 +127,13 @@ def pose_to_input(pose_json_path, latent_chunk_num, tps=False):
     rotate_one_label = one_hot_to_one_dimension(rotate_one_hot)
     action_one_label = trans_one_label * 9 + rotate_one_label
 
-    return torch.tensor(w2c_list), torch.tensor(intrinsic_list), action_one_label
+    viewmats = torch.from_numpy(w2c_list).to(dtype=torch.float32)
+    Ks = torch.from_numpy(intrinsic_list).to(dtype=torch.float32)
+    if device is not None:
+        viewmats = viewmats.to(device=device)
+        Ks = Ks.to(device=device)
+        action_one_label = action_one_label.to(device=device)
+    return viewmats, Ks, action_one_label
 
 def save_video(video, path):
     if video.ndim == 5:
@@ -196,7 +206,11 @@ def generate_video(args):
     if not args.rewrite:
         rank0_log("Warning: Prompt rewriting is disabled. This may affect the quality of generated videos.", "WARNING")
 
-    viewmats, Ks, action = pose_to_input(args.pose_json_path, (args.video_length - 1) // 4 + 1)
+    viewmats, Ks, action = pose_to_input(
+        args.pose_json_path,
+        (args.video_length - 1) // 4 + 1,
+        device=pipe.execution_device,
+    )
 
     if task == 'i2v':
         extra_kwargs['reference_image'] = args.image_path
@@ -296,8 +310,8 @@ def main():
              'Use --rewrite or --rewrite true/1 to enable, --rewrite false/0 to disable'
     )
     parser.add_argument(
-        '--offloading', type=str_to_bool, nargs='?', const=True, default=True,
-        help='Enable offloading (default: true). '
+        '--offloading', type=str_to_bool, nargs='?', const=True, default=False,
+        help='Enable CPU offloading (default: false). '
              'Use --offloading or --offloading true/1 to enable, '
              '--offloading false/0 to disable'
     )
