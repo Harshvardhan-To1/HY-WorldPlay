@@ -1738,7 +1738,7 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
         if action_ckpt is not None:
             from safetensors.torch import load_file
             safetensor_path = action_ckpt
-            state_dict = load_file(safetensor_path)
+            state_dict = load_file(safetensor_path, device="cuda")
             transformer.load_state_dict(state_dict, strict=True)
             print('HY-World 1.5 loading from: ', action_ckpt)
 
