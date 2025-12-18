@@ -1452,6 +1452,9 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
                 height = int(height)
                 height, width = self.get_closest_resolution_given_original_size((width, height), self.ideal_resolution)
 
+        # Define device early (used by mask/latents preparation below).
+        device = self.execution_device
+
         latent_target_length, latent_height, latent_width = self.get_latent_size(video_length, height, width)
         n_tokens = latent_target_length * latent_height * latent_width
         multitask_mask = self.get_task_mask(task_type, latent_target_length, device=device)
@@ -1467,8 +1470,6 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
             batch_size = len(prompt)
         else:
             batch_size = 1
-        device = self.execution_device
-
         if get_rank() == 0:
             print(
                 '\n'
