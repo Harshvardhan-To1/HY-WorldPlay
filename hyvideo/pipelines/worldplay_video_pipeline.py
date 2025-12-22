@@ -1430,6 +1430,8 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
         if get_parallel_state().sp_enabled:
             assert seed is not None
 
+        device = self.execution_device
+
         if generator is None and seed is not None:
             generator = torch.Generator(device=self.execution_device).manual_seed(seed)
 
@@ -1467,7 +1469,6 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
             batch_size = len(prompt)
         else:
             batch_size = 1
-        device = self.execution_device
 
         if get_rank() == 0:
             print(
