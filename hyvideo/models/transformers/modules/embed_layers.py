@@ -208,6 +208,13 @@ class TimestepEmbedder(nn.Module):
         nn.init.normal_(self.mlp[2].weight, std=0.02)
 
     def forward(self, t):
+        # Ensure inputs are on the same device as this module.
+        # Some callers provide CPU tensors (e.g. discrete actions) while the model
+        # is on CUDA, which would crash inside the Linear layers.
+        if isinstance(t, torch.Tensor):
+            target_device = self.mlp[0].weight.device
+            if t.device != target_device:
+                t = t.to(device=target_device, non_blocking=True)
         t_freq = timestep_embedding(
             t, self.frequency_embedding_size, self.max_period
         ).type(self.mlp[0].weight.dtype)
