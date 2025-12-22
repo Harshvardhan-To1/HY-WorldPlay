@@ -890,8 +890,18 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin):
 
     def add_action_parameters(self):
         # Initialize the embedding module for action conditioning (using Silu activation).
+        # IMPORTANT: this method is often called *after* the model has been moved to CUDA
+        # (see `WorldPlayVideoPipeline.create_pipeline`). Any newly-created modules must
+        # therefore be initialized on the same device/dtype as the existing weights,
+        # otherwise we will hit device-mismatch errors at runtime (cuda vs cpu).
+        ref_device = self.time_in.mlp[0].weight.device
+        ref_dtype = self.time_in.mlp[0].weight.dtype
+
         self.action_in = TimestepEmbedder(
-            self.hidden_size, get_activation_layer("silu")
+            self.hidden_size,
+            get_activation_layer("silu"),
+            dtype=ref_dtype,
+            device=ref_device,
         )
 
         # Zero-initialize the weights of the final layer (mlp[2]) of the embedder.
@@ -905,12 +915,16 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin):
 
         # Iterate through each transformer double-block to inject action-specific projections.
         for block in self.double_blocks:
+            block_device = block.img_attn_q.weight.device
+            block_dtype = block.img_attn_q.weight.dtype
+
             # Create a new linear projection layer for image attention properties.
             block.img_attn_prope_proj = nn.Linear(
                 block.hidden_size,
                 block.hidden_size,
                 bias=block.qkv_bias,
-                **block.factory_kwargs
+                device=block_device,
+                dtype=block_dtype,
             )
 
             # Zero-initialize the weights of this new projection layer.
