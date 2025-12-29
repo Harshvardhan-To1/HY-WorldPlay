@@ -768,6 +768,72 @@ class AutoencoderKLConv3D(ModelMixin, ConfigMixin):
             )
         return b
 
+    def _encode_temporal_sliced(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Encode using the VAE's temporal slicing + feature cache path.
+
+        Important: the VAE's temporal compression is asymmetric (first sample frame is a
+        singleton, then groups of `ffactor_temporal` frames). The plain `self.encoder(x)`
+        path does not preserve this behavior for longer sequences.
+        """
+        _, _, num_frame, _, _ = x.shape
+
+        self.clear_cache()
+        iter_ = 1 + (num_frame - 1) // self.ffactor_temporal
+        out = None
+        for i in range(iter_):
+            self._enc_conv_idx = [0]
+            if i == 0:
+                out = self.encoder(
+                    x[:, :, :1, :, :], feat_cache=self._enc_feat_map, feat_idx=self._enc_conv_idx
+                )
+            else:
+                start = 1 + self.ffactor_temporal * (i - 1)
+                end = 1 + self.ffactor_temporal * i
+                out_ = self.encoder(
+                    x[:, :, start:end, :, :],
+                    feat_cache=self._enc_feat_map,
+                    feat_idx=self._enc_conv_idx,
+                )
+                out = torch.cat([out, out_], 2)
+
+        self.clear_cache()
+        assert out is not None
+        return out
+
+    def _decode_temporal_sliced(self, z: torch.Tensor) -> torch.Tensor:
+        """
+        Decode using the VAE's temporal slicing + feature cache path.
+
+        Important: the VAE expands the temporal dimension as:
+        T_out = 1 + (T_latent - 1) * ffactor_temporal
+        which requires special handling for the first latent timestep ("first_chunk").
+        """
+        _, _, num_frame, _, _ = z.shape
+
+        self.clear_cache()
+        out = None
+        for i in range(num_frame):
+            self._conv_idx = [0]
+            if i == 0:
+                out = self.decoder(
+                    z[:, :, i : i + 1, :, :],
+                    feat_cache=self._feat_map,
+                    feat_idx=self._conv_idx,
+                    first_chunk=True,
+                )
+            else:
+                out_ = self.decoder(
+                    z[:, :, i : i + 1, :, :],
+                    feat_cache=self._feat_map,
+                    feat_idx=self._conv_idx,
+                )
+                out = torch.cat([out, out_], 2)
+
+        self.clear_cache()
+        assert out is not None
+        return out
+
     def spatial_tiled_encode(self, x: torch.Tensor):
         """Tiled spatial encoding for large inputs via overlapping."""
         B, C, T, H, W = x.shape
@@ -780,7 +846,9 @@ class AutoencoderKLConv3D(ModelMixin, ConfigMixin):
             row = []
             for j in range(0, W, overlap_size):
                 tile = x[:, :, :, i: i + self.tile_sample_min_size, j: j + self.tile_sample_min_size]
-                tile = self.encoder(tile)
+                # Use the temporally-sliced encode path to preserve the VAE's
+                # (1 + groups-of-ffactor_temporal) temporal compression behavior.
+                tile = self._encode_temporal_sliced(tile)
                 row.append(tile)
             rows.append(row)
         result_rows = []
@@ -860,7 +928,9 @@ class AutoencoderKLConv3D(ModelMixin, ConfigMixin):
             i = ri * overlap_size
             j = rj * overlap_size
             tile = z[:, :, :, i:i + self.tile_latent_min_size, j:j + self.tile_latent_min_size]
-            dec = self.decoder(tile)
+            # Important: decoding must respect the VAE's asymmetric temporal expansion
+            # (first latent -> 1 frame, remaining latents -> ffactor_temporal frames).
+            dec = self._decode_temporal_sliced(tile)
 
             pad_h = max(0, H_out_std - dec.shape[-2])
             pad_w = max(0, W_out_std - dec.shape[-1])
@@ -942,7 +1012,9 @@ class AutoencoderKLConv3D(ModelMixin, ConfigMixin):
             row = []
             for j in range(0, W, overlap_size):
                 tile = z[:, :, :, i: i + self.tile_latent_min_size, j: j + self.tile_latent_min_size]
-                decoded = self.decoder(tile)
+                # Important: decoding must respect the VAE's asymmetric temporal expansion
+                # (first latent -> 1 frame, remaining latents -> ffactor_temporal frames).
+                decoded = self._decode_temporal_sliced(tile)
                 row.append(decoded)
             rows.append(row)
 
